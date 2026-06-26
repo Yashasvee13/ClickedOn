@@ -1,5 +1,10 @@
 import { extractJson } from "./extract-json";
-import { mockStream, type MockBehavior, type MockState } from "./anthropic-mock";
+import {
+  mockStream,
+  type MockBehavior,
+  type MockState,
+  type TransientError,
+} from "./anthropic-mock";
 
 export interface GenerateInput {
   /** Drives the mock streaming client (see anthropic-mock.ts). */
@@ -16,6 +21,34 @@ export interface GenerateResult {
 }
 
 const MAX_REVISIONS = 3;
+const MAX_STREAM_RETRIES = 5;
+
+function isTransientError(err: unknown): boolean {
+  return err instanceof Error && (err as TransientError).status === 429;
+}
+
+function isTruncatedJsonError(err: unknown): boolean {
+  return err instanceof Error && err.message === "No fenced JSON block found";
+}
+
+async function streamDraft(
+  behavior: MockBehavior,
+  state: MockState,
+): Promise<void> {
+  for (let retry = 0; retry < MAX_STREAM_RETRIES; retry++) {
+    try {
+      const text = await mockStream(behavior, state);
+      extractJson(text);
+      return;
+    } catch (err) {
+      if (isTransientError(err) || isTruncatedJsonError(err)) {
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error("Failed to stream draft after retries");
+}
 
 /**
  * Runs one content-generation pass: stream a draft, extract it, revise until it
@@ -28,21 +61,27 @@ const MAX_REVISIONS = 3;
 export async function generate(input: GenerateInput): Promise<GenerateResult> {
   const state: MockState = { calls: 0 };
 
-  // The model call can fail transiently (rate limits) or return a truncated
-  // stream. Right now a single hiccup takes down the whole run.
-  const text = await mockStream(input.behavior, state);
-  extractJson(text);
+  try {
+    await streamDraft(input.behavior, state);
+  } catch {
+    return { status: "error", attempts: 0 };
+  }
 
   // Revise until the draft passes review.
   let attempt = 0;
-  while (!input.reviewPasses(attempt) && attempt < 50) {
+  while (!input.reviewPasses(attempt) && attempt < MAX_REVISIONS) {
     attempt += 1;
   }
 
-  // Kick off the next stage and return.
-  void input.advanceToNextStage().catch(() => {
-    /* ignored */
-  });
+  if (!input.reviewPasses(attempt)) {
+    return { status: "error", attempts: attempt };
+  }
+
+  try {
+    await input.advanceToNextStage();
+  } catch {
+    return { status: "error", attempts: attempt };
+  }
 
   return { status: "ok", attempts: attempt };
 }
